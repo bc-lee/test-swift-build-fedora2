@@ -1,0 +1,192 @@
+name: Build
+
+defaults:
+  run:
+    shell: bash -exu {0}
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, '${{ matrix.arch }}']
+    container:
+      image: fedora:39
+      volumes:
+        - /home/builder/.work:/work
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # system means use the clang provided by the operating system,
+        # from-source means build clang from source,
+        # and prebuilt means use the clang provided by the swift toolchain
+        arch: [x64, arm64]
+        clang: [system, from-source]
+        include:
+          - arch: arm64
+            clang: prebuilt
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy checkout
+        run: |
+          mkdir -p /work/src/build-script
+          cp -R . /work/src/build-script
+
+      - name: Install dependencies
+        run: |
+          # Basic dependencies
+          deps="curl git which patch ninja-build dnf-plugins-core"
+          dnf install -y ${deps}
+
+          # Install build dependencies for swift
+          dnf builddep -y swift-lang
+
+      - name: Build clang
+        if: matrix.clang == 'from-source'
+        run: |
+          echo "PATH=$PATH"
+          # Install build dependencies for clang
+          dnf builddep -y clang
+          dnf install -y lld
+
+          # Checkout llvm-project
+          mkdir -p /work/src
+          cd /work/src
+          git clone https://github.com/llvm/llvm-project --no-checkout || true
+          cd llvm-project
+          TAG="llvmorg-17.0.6"
+          git fetch origin "$TAG"
+          git checkout -f "$TAG"
+
+          # Build clang
+          CC=$(which clang)
+          CXX=$(which clang++)
+          BUILD_DIR="$PWD/build"
+          INSTALL_DIR=/usr/local
+
+          targets_to_build=""
+          if [[ "${{ matrix.arch }}" == "x64" ]]; then
+            targets_to_build="X86"
+          elif [[ "${{ matrix.arch }}" == "arm64" ]]; then
+            targets_to_build="AArch64"
+          else
+            echo "Unknown arch: ${{ matrix.arch }}"
+            exit 1
+          fi
+
+          cmake \
+            -B "$BUILD_DIR" \
+            -G Ninja \
+            llvm \
+            -DLLVM_ENABLE_PROJECTS='clang' \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DLLVM_TARGETS_TO_BUILD="$targets_to_build" \
+            -DLLVM_ENABLE_LLD=ON \
+            -DLLVM_ENABLE_ZSTD=OFF
+          cmake --build "$BUILD_DIR"
+          cmake --build "$BUILD_DIR" --target install
+
+          # verify clang
+          /usr/local/bin/clang --version
+
+          # Check if the build succeeded
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf -- "$tmpdir"' EXIT
+
+          cat > "$tmpdir/test.cpp" <<EOF
+          #include <iostream>
+          int main() {
+            std::cout << "Hello, world!" << std::endl;
+            return 0;
+          }
+          EOF
+
+          /usr/local/bin/clang++ -o "$tmpdir/test" "$tmpdir/test.cpp"
+          "$tmpdir/test" | grep -q "Hello, world!"
+
+          echo "clang build succeeded"
+
+      - name: Download old swift
+        run: |
+          mkdir -p /work/toolchain
+          cd /work/toolchain
+          if [[ -d swift-5.8.1-RELEASE-ubi9 ]]; then
+            echo "swift-5.8.1-RELEASE-ubi9 already exists"
+            exit 0
+          fi
+          suffix=""
+          if [[ $(uname -m) == "aarch64" ]]; then
+            suffix="-aarch64"
+          fi
+          curl -OL "https://download.swift.org/swift-5.8.1-release/ubi9$suffix/swift-5.8.1-RELEASE/swift-5.8.1-RELEASE-ubi9$suffix.tar.gz"
+          tar -xf "swift-5.8.1-RELEASE-ubi9$suffix.tar.gz"
+          rm "swift-5.8.1-RELEASE-ubi9$suffix.tar.gz"
+          if [[ -n "$suffix" ]]; then
+            mv swift-5.8.1-RELEASE-ubi9* swift-5.8.1-RELEASE-ubi9
+          fi
+
+      - name: Build swift
+        run: |
+          if [[ "${{ matrix.clang }}" == "build-from-source" ]]; then
+            export PATH="/usr/bin:/usr/sbin:/bin:/sbin:/work/toolchain/swift-5.8.1-RELEASE-ubi9/usr/bin"
+          elif [[ "${{ matrix.clang }}" == "prebuilt" ]]; then
+            export PATH="/work/toolchain/swift-5.8.1-RELEASE-ubi9/usr/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin"
+          else
+            export PATH="/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin:/work/toolchain/swift-5.8.1-RELEASE-ubi9/usr/bin"
+          fi
+
+          echo "PATH=$PATH"
+          echo "clang: $(which clang)"
+          echo "swift: $(which swift)"
+
+          # Checkout swift
+          mkdir -p /work/src/swift
+          cd /work/src/swift
+          if [[ ! -d swift ]]; then
+            git clone https://github.com/apple/swift -b release/5.9
+          else
+            # Reset all git repositories to remove any local changes
+            for dir in $(find . -type d -name ".git"); do
+              git -C "$dir/.." reset --hard
+            done
+          fi
+          args=""
+          if [[ ! -d llvm-project ]]; then
+            args="--clone"
+          fi
+          cd swift
+          utils/update-checkout ${args} --scheme release/5.9
+
+          # Download patch
+          mkdir -p /work/src/patches
+          cd /work/src/patches
+          curl -OL https://src.fedoraproject.org/rpms/swift-lang/raw/b1cf890222c620e4be45ae54a48fb6c1ac52465a/f/fclose_issues.patch
+          curl -OL https://src.fedoraproject.org/rpms/swift-lang/raw/b1cf890222c620e4be45ae54a48fb6c1ac52465a/f/new_glibc.patch
+
+          cd /work/src/swift
+          pushd swift
+          patch -p1 < /work/src/build-script/patches/wdocumentation.patch
+          popd
+          pushd swift-corelibs-foundation
+          patch -p1 < /work/src/patches/new_glibc.patch
+          popd
+          pushd swift-tools-support-core
+          patch -p1 < /work/src/patches/fclose_issues.patch
+          popd
+
+          # Build swift
+          rm -rf build
+          swift/utils/build-script \
+            --preset=buildbot_linux,no_test \
+            install_destdir=$(pwd)/build-${{ matrix.clang }} \
+          installable_package=$(pwd)/swift-${{ matrix.clang }}.tar.gz
