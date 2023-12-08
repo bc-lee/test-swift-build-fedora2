@@ -8,6 +8,9 @@ on:
   push:
     branches:
       - master
+  pull_request:
+    branches:
+      - master
 
 jobs:
   build:
@@ -23,7 +26,9 @@ jobs:
         # system means use the clang provided by the operating system,
         # from-source means build clang from source,
         # and prebuilt means use the clang provided by the swift toolchain
-        arch: [x64, arm64]
+        # TODO: Re-enable x64 before merging
+        # arch: [x64, arm64]
+        arch: [arm64]
         clang: [system, from-source]
         include:
           - arch: arm64
@@ -176,6 +181,7 @@ jobs:
           cd /work/src/swift
           pushd swift
           patch -p1 < /work/src/build-script/patches/wdocumentation.patch
+          patch -p1 < /work/src/build-script/patches/densemap.patch
           popd
           pushd swift-corelibs-foundation
           patch -p1 < /work/src/patches/new_glibc.patch
